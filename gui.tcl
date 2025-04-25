@@ -18,7 +18,6 @@ button .b2 -text "Generate UVM Files" -command {
     if {$filePath eq ""} {
         tk_messageBox -message "Please select a .sv file first!" -icon warning
     } else {
-        # Use the Perl command as you intended, assuming perl is in PATH
         set result [exec perl generate_uvm.pl $filePath]
         tk_messageBox -message "Generation complete! Check the output folder." -icon info
     }
@@ -27,3 +26,4 @@ pack .b2
 
 label .status -text "No file selected"
 pack .status
+

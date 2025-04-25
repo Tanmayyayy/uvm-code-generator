@@ -2,219 +2,142 @@
 
 use strict;
 use warnings;
+use File::Basename;
+use File::Copy;
 
-# Get the module name from the command line argument (passed from TCL script)
-my $module_name = $ARGV[0];
+my $sv_file = $ARGV[0];
 
-# Check if the module name is provided
-if (not defined $module_name) {
-    die "Error: Module name must be provided as an argument.\n";
+if (!defined $sv_file || !-e $sv_file) {
+    die "Usage: perl generate_uvm.pl <module_file.sv>\n";
 }
 
-# Define the path to your Verilog file (using the module name)
-my $module_file = "$module_name.sv";  # Assuming module file name matches module_name.sv
+open(my $fh, '<', $sv_file) or die "Could not open file '$sv_file' $!";
 
-# Check if the Verilog file exists
-if (!-e $module_file) {
-    die "Cannot open file $module_file: No such file or directory\n";
+my $module_name;
+my @ports;
+
+while (my $line = <$fh>) {
+    chomp $line;
+    if ($line =~ /module\s+(\w+)/) {
+        $module_name = $1;
+    }
+    while ($line =~ /(input|output|inout)\s+(?:logic|bit)?\s*(\[.*?\])?\s*(\w+)/g) {
+        push @ports, {
+            dir => $1,
+            width => $2 || '',
+            name => $3
+        };
+    }
 }
 
-# Create output directory based on module name
-my $dir = "$module_name\_uvm";
-mkdir $dir unless -d $dir;
+close $fh;
 
-# --- Sequence Item ---
-open my $seq_item_fh, '>', "$dir/sequence_item_$module_name.sv" or die "Cannot open sequence item file: $!";
-print $seq_item_fh << "SEQ_ITEM";
-`ifndef SEQUENCE_ITEM_$module_name
-`define SEQUENCE_ITEM_$module_name
+mkdir("output") unless -d "output";
+copy($sv_file, "output/" . basename($sv_file));
 
-class ${module_name}_seq_item extends uvm_sequence_item;
-    `uvm_field_int(a, UVM_ALL_ON)
-    `uvm_field_int(b, UVM_ALL_ON)
-    `uvm_field_int(sum, UVM_ALL_ON)
+sub write_file {
+    my ($filename, $content) = @_;
+    open my $out, '>', $filename or die "Cannot open $filename: $!";
+    print $out $content;
+    close $out;
+}
 
-    function new(string name = "");
-        super.new(name);
-    endfunction
-endclass
+sub generate_interface {
+    my $fname = "output/${module_name}_if.sv";
+    my $content = "interface ${module_name}_if();\n";
+    foreach my $p (@ports) {
+        $content .= "$p->{dir} logic $p->{width} $p->{name};\n";
+    }
+    $content .= "endinterface\n";
+    write_file($fname, $content);
+}
 
-`endif
-SEQ_ITEM
-close $seq_item_fh;
+sub generate_seq_item {
+    my $fname = "output/${module_name}_seq_item.sv";
+    my $content = "class ${module_name}_seq_item extends uvm_sequence_item;\n";
+    $content .= "  `uvm_object_utils(${module_name}_seq_item)\n";
+    foreach my $p (@ports) {
+        if ($p->{dir} eq 'input') {
+            $content .= "  rand logic $p->{width} $p->{name};\n";
+        }
+    }
+    $content .= "  function new(string name = \"\");\n    super.new(name);\n  endfunction\nendclass\n";
+    write_file($fname, $content);
+}
 
-# --- Driver ---
-open my $driver_fh, '>', "$dir/driver_$module_name.sv" or die "Cannot open driver file: $!";
-print $driver_fh << "DRIVER";
-`ifndef DRIVER_$module_name
-`define DRIVER_$module_name
+sub generate_driver {
+    my $fname = "output/${module_name}_driver.sv";
+    my $content = "class ${module_name}_driver extends uvm_driver#(${module_name}_seq_item);\n";
+    $content .= "  `uvm_component_utils(${module_name}_driver)\n";
+    $content .= "  virtual ${module_name}_if vif;\n";
+    $content .= "  function new(string name, uvm_component parent);\n    super.new(name, parent);\n  endfunction\n";
+    $content .= "  task run_phase(uvm_phase phase);\n    forever begin\n      ${module_name}_seq_item req;\n      seq_item_port.get_next_item(req);\n";
+    foreach my $p (@ports) {
+        if ($p->{dir} eq 'input') {
+            $content .= "      vif.$p->{name} = req.$p->{name};\n";
+        }
+    }
+    $content .= "      seq_item_port.item_done();\n    end\n  endtask\nendclass\n";
+    write_file($fname, $content);
+}
 
-class ${module_name}_driver extends uvm_driver#(${module_name}_seq_item);
-    `uvm_component_utils(${module_name}_driver)
+sub generate_monitor {
+    my $fname = "output/${module_name}_monitor.sv";
+    my $content = "class ${module_name}_monitor extends uvm_monitor;\n";
+    $content .= "  `uvm_component_utils(${module_name}_monitor)\n";
+    $content .= "  virtual ${module_name}_if vif;\n";
+    $content .= "  function new(string name, uvm_component parent);\n    super.new(name, parent);\n  endfunction\nendclass\n";
+    write_file($fname, $content);
+}
 
-    function new(string name = "");
-        super.new(name);
-    endfunction
+sub generate_tb {
+    my $fname = "output/${module_name}_tb.sv";
+    my $content = "module ${module_name}_tb;\n  import uvm_pkg::*;\n  `include \"uvm_macros.svh\"\n\n  ${module_name}_if intf();\n  ${module_name} dut (/* connect ports */);\n\n  initial begin\n    run_test();\n  end\nendmodule\n";
+    write_file($fname, $content);
+}
 
-    virtual task run();
-        // Implement the driver logic here
-    endtask
-endclass
+sub generate_sequencer {
+    my $fname = "output/${module_name}_sequencer.sv";
+    my $content = "class ${module_name}_sequencer extends uvm_sequencer#(${module_name}_seq_item);\n";
+    $content .= "  `uvm_component_utils(${module_name}_sequencer)\n";
+    $content .= "  function new(string name, uvm_component parent);\n    super.new(name, parent);\n  endfunction\nendclass\n";
+    write_file($fname, $content);
+}
 
-`endif
-DRIVER
-close $driver_fh;
+sub generate_agent {
+    my $fname = "output/${module_name}_agent.sv";
+    my $content = "class ${module_name}_agent extends uvm_agent;\n";
+    $content .= "  `uvm_component_utils(${module_name}_agent)\n";
+    $content .= "  ${module_name}_driver drv;\n  ${module_name}_monitor mon;\n  ${module_name}_sequencer seqr;\n\n  function new(string name, uvm_component parent);\n    super.new(name, parent);\n  endfunction\n\n  function void build_phase(uvm_phase phase);\n    super.build_phase(phase);\n    drv  = ${module_name}_driver::type_id::create(\"drv\", this);\n    mon  = ${module_name}_monitor::type_id::create(\"mon\", this);\n    seqr = ${module_name}_sequencer::type_id::create(\"seqr\", this);\n  endfunction\nendclass\n";
+    write_file($fname, $content);
+}
 
-# --- Monitor ---
-open my $monitor_fh, '>', "$dir/monitor_$module_name.sv" or die "Cannot open monitor file: $!";
-print $monitor_fh << "MONITOR";
-`ifndef MONITOR_$module_name
-`define MONITOR_$module_name
+sub generate_env {
+    my $fname = "output/${module_name}_env.sv";
+    my $content = "class ${module_name}_env extends uvm_env;\n";
+    $content .= "  `uvm_component_utils(${module_name}_env)\n";
+    $content .= "  ${module_name}_agent agent;\n\n  function new(string name, uvm_component parent);\n    super.new(name, parent);\n  endfunction\n\n  function void build_phase(uvm_phase phase);\n    super.build_phase(phase);\n    agent = ${module_name}_agent::type_id::create(\"agent\", this);\n  endfunction\nendclass\n";
+    write_file($fname, $content);
+}
 
-class ${module_name}_monitor extends uvm_monitor;
-    `uvm_component_utils(${module_name}_monitor)
+sub generate_test {
+    my $fname = "output/${module_name}_test.sv";
+    my $content = "class ${module_name}_test extends uvm_test;\n";
+    $content .= "  `uvm_component_utils(${module_name}_test)\n";
+    $content .= "  ${module_name}_env env;\n  ${module_name}_seq_item seq;\n\n  function new(string name, uvm_component parent);\n    super.new(name, parent);\n  endfunction\n\n  function void build_phase(uvm_phase phase);\n    super.build_phase(phase);\n    env = ${module_name}_env::type_id::create(\"env\", this);\n  endfunction\n\n  task run_phase(uvm_phase phase);\n    phase.raise_objection(this);\n    seq = ${module_name}_seq_item::type_id::create(\"seq\");\n    env.agent.seqr.start(seq);\n    #100;\n    phase.drop_objection(this);\n  endtask\nendclass\n";
+    write_file($fname, $content);
+}
 
-    function new(string name = "");
-        super.new(name);
-    endfunction
+# Generate all components
+generate_interface();
+generate_seq_item();
+generate_driver();
+generate_monitor();
+generate_tb();
+generate_sequencer();
+generate_agent();
+generate_env();
+generate_test();
 
-    virtual task run();
-        // Implement the monitor logic here
-    endtask
-endclass
+print "UVM files generated successfully in output/.\n";
 
-`endif
-MONITOR
-close $monitor_fh;
-
-# --- Environment ---
-open my $env_fh, '>', "$dir/env_$module_name.sv" or die "Cannot open environment file: $!";
-print $env_fh << "ENV";
-`ifndef ENV_$module_name
-`define ENV_$module_name
-
-class ${module_name}_env extends uvm_env;
-    `uvm_component_utils(${module_name}_env)
-
-    ${module_name}_driver driver;
-    ${module_name}_monitor monitor;
-
-    function new(string name = "");
-        super.new(name);
-    endfunction
-endclass
-
-`endif
-ENV
-close $env_fh;
-
-# --- Agent ---
-open my $agent_fh, '>', "$dir/agent_$module_name.sv" or die "Cannot open agent file: $!";
-print $agent_fh << "AGENT";
-`ifndef AGENT_$module_name
-`define AGENT_$module_name
-
-class ${module_name}_agent extends uvm_agent;
-    `uvm_component_utils(${module_name}_agent)
-
-    ${module_name}_driver driver;
-    ${module_name}_monitor monitor;
-
-    function new(string name = "");
-        super.new(name);
-    endfunction
-endclass
-
-`endif
-AGENT
-close $agent_fh;
-
-# --- Test ---
-open my $test_fh, '>', "$dir/test_$module_name.sv" or die "Cannot open test file: $!";
-print $test_fh << "TEST";
-`ifndef TEST_$module_name
-`define TEST_$module_name
-
-class ${module_name}_test extends uvm_test;
-    `uvm_component_utils(${module_name}_test)
-
-    ${module_name}_env env;
-
-    function new(string name = "");
-        super.new(name);
-    endfunction
-
-    virtual task run_phase(uvm_phase phase);
-        // Implement the test logic here
-    endtask
-endclass
-
-`endif
-TEST
-close $test_fh;
-
-# --- Top Module ---
-open my $top_fh, '>', "$dir/top_$module_name.sv" or die "Cannot open top module file: $!";
-print $top_fh << "TOP";
-`ifndef TOP_$module_name
-`define TOP_$module_name
-
-module top;
-    logic clk;
-    logic rst_n;
-    logic [3:0] a, b;
-    logic [3:0] sum;
-
-    // Instantiate UVM environment and other components here
-    // Example: ${module_name}_test test_inst;
-
-endmodule
-
-`endif
-TOP
-close $top_fh;
-
-# --- UVM Agent Configuration File ---
-open my $config_fh, '>', "$dir/config_$module_name.sv" or die "Cannot open agent config file: $!";
-print $config_fh << "CONFIG";
-`ifndef CONFIG_$module_name
-`define CONFIG_$module_name
-
-class ${module_name}_config extends uvm_config_db#(${module_name}_seq_item);
-    `uvm_component_utils(${module_name}_config)
-
-    function new(string name = "");
-        super.new(name);
-    endfunction
-
-    // Define config options and methods to load them
-endclass
-
-`endif
-CONFIG
-close $config_fh;
-
-# --- UVM Sequence Class ---
-open my $seq_fh, '>', "$dir/sequence_$module_name.sv" or die "Cannot open sequence file: $!";
-print $seq_fh << "SEQUENCE";
-`ifndef SEQUENCE_$module_name
-`define SEQUENCE_$module_name
-
-class ${module_name}_sequence extends uvm_sequence#(${module_name}_seq_item);
-    `uvm_component_utils(${module_name}_sequence)
-
-    function new(string name = "");
-        super.new(name);
-    endfunction
-
-    virtual task body();
-        // Implement sequence body for generating stimulus
-    endtask
-endclass
-
-`endif
-SEQUENCE
-close $seq_fh;
-
-# Print completion message
-print "UVM code generated in directory: $dir\n";
